@@ -360,7 +360,7 @@ fn duration_label(l: Lang, d: DurationFilter) -> &'static str {
     match d {
         DurationFilter::Any => l.t("Qualquer duração", "Any length"),
         DurationFilter::Short => l.t("Menos de 4 min", "Under 4 min"),
-        DurationFilter::Medium => l.t("4 a 20 min", "4–20 min"),
+        DurationFilter::Medium => l.t("4 a 20 min", "4 to 20 min"),
         DurationFilter::Long => l.t("Mais de 20 min", "Over 20 min"),
     }
 }
@@ -1371,7 +1371,7 @@ impl App {
                         Some(f) => ui.weak(format!("ffmpeg: {}", f.display())),
                         None => ui.colored_label(
                             Color32::GOLD,
-                            l.t("ffmpeg não encontrado — instale com: brew install ffmpeg", "ffmpeg not found — install with: brew install ffmpeg"),
+                            l.t("ffmpeg não encontrado. Instale com: brew install ffmpeg", "ffmpeg not found. Install with: brew install ffmpeg"),
                         ),
                     };
                     ui.add_space(2.0);

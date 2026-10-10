@@ -3,7 +3,7 @@
 **Português** · [English](#english)
 
 Um app **nativo para macOS (Apple Silicon)**, escrito em **Rust**, para pesquisar e baixar vídeos do YouTube.
-Interface em **português (Brasil)** e inglês. Usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) e [`ffmpeg`](https://ffmpeg.org) por baixo dos panos — e **atualiza o `yt-dlp` sozinho**.
+Interface em **português (Brasil)** e inglês. Usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) e [`ffmpeg`](https://ffmpeg.org) por baixo dos panos e **atualiza o `yt-dlp` sozinho**.
 
 ## Recursos
 
@@ -74,7 +74,7 @@ A **native macOS (Apple Silicon)** app written in **Rust** to search and downloa
 - **Audio tracks:** pick the dubbed language when a video has several.
 - **Subtitles:** save as `.srt`, embed into the MP4, or download subtitles only (manual and auto-generated).
 - **Download queue** with progress, speed, ETA and cancel.
-- **Bundled tools** (`yt-dlp`, `ffmpeg`, `ffprobe`) — nothing to install.
+- **Bundled tools** (`yt-dlp`, `ffmpeg`, `ffprobe`), nothing to install.
 - **Automatic `yt-dlp` updates** (once a day, checksum-verified).
 
 ### Install

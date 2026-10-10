@@ -16,6 +16,8 @@ jobs:
     runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags, to list the changes since the previous release
 
       - name: Check tag matches Cargo.toml version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -68,8 +70,14 @@ jobs:
           range=${prev:+$prev..}$TAG
           git log --no-merges --pretty='- %s' "$range" | grep -v '^- Add GitHub Actions' > changes.txt || true
           [[ -s changes.txt ]] || echo "- Initial release" > changes.txt
-          sed -e "s/__VERSION__/$version/g" -e "s/__SHA256__/$SHA/g" \
-              -e "/__CHANGES__/{r changes.txt" -e "d}" .github/release-notes.md > notes.md
+          python3 - "$version" "$SHA" <<'PY'
+          import sys
+          version, sha = sys.argv[1], sys.argv[2]
+          notes = open(".github/release-notes.md").read()
+          changes = open("changes.txt").read().strip()
+          notes = notes.replace("__VERSION__", version).replace("__SHA256__", sha).replace("__CHANGES__", changes)
+          open("notes.md", "w").write(notes)
+          PY
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$DMG" --clobber
           else

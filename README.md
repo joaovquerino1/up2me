@@ -46,6 +46,12 @@ open target/up2me.app
 - Para desenvolver sem embutir as ferramentas: `brew install yt-dlp ffmpeg` e `cargo run`.
 - O app é assinado apenas localmente (ad-hoc). Ao abrir em outro Mac, use clique direito → **Abrir** na primeira vez.
 
+## Publicar uma nova versão
+
+1. Aumente `version` em `Cargo.toml` (ex.: `0.2.0`) e faça commit.
+2. Crie e envie a tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. O workflow **Release** compila, gera o DMG e publica o release no GitHub automaticamente. (Em *Actions → Release → Run workflow* dá para fazer um teste que só gera o DMG, sem publicar.)
+
 ## Aviso legal
 
 Baixar conteúdo do YouTube pode violar os [Termos de Serviço](https://www.youtube.com/t/terms) da plataforma e direitos autorais. Use o up2me apenas com conteúdo que você tem direito de salvar (próprio, licenciado, domínio público, Creative Commons etc.). Você é responsável pelo uso que faz do software. Este projeto não é afiliado ao YouTube/Google.
@@ -91,6 +97,10 @@ open target/up2me.app
 ```
 
 `UP2ME_NATIVE=1 ./scripts/bundle.sh` tunes the binary for your own chip; the default runs on any M-series Mac. The app is ad-hoc signed, so on another Mac use right-click → **Open** the first time.
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, commit, then `git tag v0.2.0 && git push origin v0.2.0`. The **Release** workflow builds the DMG and publishes the GitHub release. *Actions → Release → Run workflow* does a dry run that only builds the DMG.
 
 ### Legal
 

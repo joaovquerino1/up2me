@@ -1,0 +1,77 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching `version` in Cargo.toml) to build the DMG and publish a GitHub release.
+# "Run workflow" from the Actions tab does a dry run: builds the DMG and uploads it as a
+# temporary artifact, without creating a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "${GITHUB_REF_NAME#v}" != "$crate_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build app bundle (fetches yt-dlp + ffmpeg, checksum-verified yt-dlp)
+        run: ./scripts/bundle.sh
+
+      - name: Build DMG
+        run: |
+          for attempt in 1 2 3; do
+            ./scripts/make-dmg.sh && break
+            echo "hdiutil failed (attempt $attempt), retrying..." && sleep 5
+          done
+          ls -lh target/*.dmg
+
+      - name: Compute checksum
+        id: sum
+        run: |
+          dmg=$(ls target/up2me-*-arm64.dmg)
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+          echo "sha=$(shasum -a 256 "$dmg" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: up2me-dmg
+          path: ${{ steps.sum.outputs.dmg }}
+          retention-days: 7
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DMG: ${{ steps.sum.outputs.dmg }}
+          SHA: ${{ steps.sum.outputs.sha }}
+        run: |
+          version="${TAG#v}"
+          # Changes since the previous tag (or all commits for the first release)
+          prev=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          range=${prev:+$prev..}$TAG
+          git log --no-merges --pretty='- %s' "$range" | grep -v '^- Add GitHub Actions' > changes.txt || true
+          [[ -s changes.txt ]] || echo "- Initial release" > changes.txt
+          sed -e "s/__VERSION__/$version/g" -e "s/__SHA256__/$SHA/g" \
+              -e "/__CHANGES__/{r changes.txt" -e "d}" .github/release-notes.md > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --clobber
+          else
+            gh release create "$TAG" "$DMG" --verify-tag --title "up2me $version" --notes-file notes.md
+          fi

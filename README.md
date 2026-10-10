@@ -17,6 +17,16 @@ Interface em **português (Brasil)** e inglês. Usa [`yt-dlp`](https://github.co
 - **Atualização automática do `yt-dlp`** (1x por dia, com verificação de checksum).
 - Notificação do macOS ao concluir um download.
 
+## Instalar
+
+1. Baixe o `up2me-*-arm64.dmg` na página de [Releases](https://github.com/joaovquerino1/up2me/releases).
+2. Abra o DMG e arraste o **up2me** para **Applications**.
+3. **Primeira abertura:** o app é assinado apenas localmente (não é notarizado pela Apple), então o macOS vai bloqueá-lo. Tente abrir uma vez, depois vá em **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**. Ou, no Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/up2me.app
+```
+
 ## Requisitos
 
 - Mac com Apple Silicon (M1 ou mais novo), macOS 12+.
@@ -29,6 +39,7 @@ git clone https://github.com/joaovquerino1/up2me.git
 cd up2me
 ./scripts/bundle.sh        # baixa yt-dlp/ffmpeg, compila e gera target/up2me.app
 open target/up2me.app
+./scripts/make-dmg.sh    # (opcional) gera o instalador .dmg
 ```
 
 - `UP2ME_NATIVE=1 ./scripts/bundle.sh` otimiza o binário para o chip da sua máquina (ex.: M3). O padrão roda em qualquer chip M.
@@ -59,6 +70,16 @@ A **native macOS (Apple Silicon)** app written in **Rust** to search and downloa
 - **Download queue** with progress, speed, ETA and cancel.
 - **Bundled tools** (`yt-dlp`, `ffmpeg`, `ffprobe`) — nothing to install.
 - **Automatic `yt-dlp` updates** (once a day, checksum-verified).
+
+### Install
+
+1. Download `up2me-*-arm64.dmg` from [Releases](https://github.com/joaovquerino1/up2me/releases).
+2. Open the DMG and drag **up2me** into **Applications**.
+3. **First launch:** the app is only ad-hoc signed (not Apple-notarized), so macOS will block it. Try to open it once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Or in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/up2me.app
+```
 
 ### Build
 

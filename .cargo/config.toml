@@ -1,0 +1,7 @@
+[build]
+target = "aarch64-apple-darwin"
+
+# Baseline that runs on every Apple Silicon Mac (M1 and later).
+# For a build tuned to the machine you compile on: UP2ME_NATIVE=1 ./scripts/bundle.sh
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]

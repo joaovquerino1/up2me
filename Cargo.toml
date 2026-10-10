@@ -1,6 +1,6 @@
 [package]
 name = "up2me"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A native macOS (Apple Silicon) YouTube search and downloader built with Rust, egui and yt-dlp"
 license = "MIT"

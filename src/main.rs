@@ -52,6 +52,15 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Shows the home folder as `~` so UI text stays short and doesn't expose the user name.
+fn pretty_path(p: &std::path::Path) -> String {
+    match p.strip_prefix(home()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
+    }
+}
+
 fn settings_path() -> PathBuf {
     home().join("Library/Application Support/up2me/settings.json")
 }
@@ -527,6 +536,9 @@ impl App {
             let item = Item { id: video_id(&url).unwrap_or_default(), url, title: String::new(), channel: None, duration: None, views: None, upload_date: None, live: false };
             app.start_job(&item, &opts, &cc.egui_ctx);
             app.tab = Tab::Downloads;
+        }
+        if env("UP2ME_CC").is_some() {
+            app.filters.creative_commons = true;
         }
         if let Some(q) = env("UP2ME_QUERY") {
             app.query = q;
@@ -1200,7 +1212,7 @@ impl App {
             ui.separator();
             ui.label(RichText::new(l.t("Salvar em", "Save to")).strong());
             ui.horizontal(|ui| {
-                ui.add(egui::Label::new(RichText::new(self.settings.out_dir.display().to_string()).weak()).truncate());
+                ui.add(egui::Label::new(RichText::new(pretty_path(&self.settings.out_dir)).weak()).truncate());
             });
             if ui.button(l.t("Alterar pasta…", "Change folder…")).clicked() {
                 if let Some(dir) = rfd::FileDialog::new().set_directory(&self.settings.out_dir).pick_folder() {
@@ -1332,7 +1344,7 @@ impl App {
         card(ui, false, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(l.t("Pasta de downloads", "Download folder")).strong());
-            ui.add(egui::Label::new(RichText::new(s.out_dir.display().to_string()).weak()).truncate());
+            ui.add(egui::Label::new(RichText::new(pretty_path(&s.out_dir)).weak()).truncate());
             ui.horizontal(|ui| {
                 if ui.button(l.t("Alterar…", "Change…")).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().set_directory(&s.out_dir).pick_folder() {

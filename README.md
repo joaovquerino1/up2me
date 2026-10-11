@@ -5,6 +5,12 @@
 Um app **nativo para macOS (Apple Silicon)**, escrito em **Rust**, para pesquisar e baixar vídeos do YouTube.
 Interface em **português (Brasil)** e inglês. Usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) e [`ffmpeg`](https://ffmpeg.org) por baixo dos panos e **atualiza o `yt-dlp` sozinho**.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="up2me: busca com filtros e painel de opções de download" width="900">
+</p>
+
+<sub>Captura de tela com vídeos de código aberto da Blender Foundation, licenciados sob Creative Commons (CC BY). / Screenshot using open movies by the Blender Foundation, licensed under Creative Commons (CC BY).</sub>
+
 ## Recursos
 
 - **Busca no YouTube** dentro do app (ou cole um link).

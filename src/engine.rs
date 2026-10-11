@@ -9,6 +9,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+/// Browser whose cookies yt-dlp should use (age-restricted / sign-in videos). `None` = off.
+static COOKIES: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_cookies_browser(browser: Option<String>) {
+    *COOKIES.write().unwrap() = browser.filter(|b| !b.is_empty());
+}
+
+fn cookie_args() -> Vec<String> {
+    match COOKIES.read().unwrap().as_deref() {
+        Some(b) => vec!["--cookies-from-browser".into(), b.to_owned()],
+        None => Vec::new(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tools {
     pub ytdlp: PathBuf,
@@ -300,7 +314,9 @@ impl Info {
 
 pub fn fetch_info(tools: &Tools, url: &str) -> Result<Info> {
     let out = Command::new(&tools.ytdlp)
-        .args(["-J", "--no-playlist", "--no-warnings", "--", url])
+        .args(["-J", "--no-playlist", "--no-warnings"])
+        .args(cookie_args())
+        .args(["--", url])
         .stdin(Stdio::null())
         .output()
         .context("failed to run yt-dlp")?;
@@ -313,7 +329,9 @@ pub fn fetch_info(tools: &Tools, url: &str) -> Result<Info> {
 /// Upload date (YYYYMMDD) for one video; used to sort search results "oldest first".
 pub fn fetch_upload_date(tools: &Tools, id: &str) -> Option<String> {
     let out = Command::new(&tools.ytdlp)
-        .args(["--skip-download", "--no-playlist", "--no-warnings", "--print", "upload_date", "--"])
+        .args(["--skip-download", "--no-playlist", "--no-warnings", "--print", "upload_date"])
+        .args(cookie_args())
+        .arg("--")
         .arg(format!("https://www.youtube.com/watch?v={id}"))
         .stdin(Stdio::null())
         .output()
@@ -503,9 +521,25 @@ impl Item {
 
 pub fn search(tools: &Tools, query: &str, filters: &Filters, limit: usize) -> Result<Vec<Item>> {
     let url = format!("https://www.youtube.com/results?search_query={}&sp={}", percent_encode(query), filters.sp());
+    Ok(list_entries(tools, &url, limit)?.1)
+}
+
+/// True for links that point at a whole playlist (not a single video inside one).
+pub fn is_playlist_url(url: &str) -> bool {
+    url.contains("youtube.com/playlist") && url.contains("list=")
+}
+
+/// Title and videos of a playlist (flat listing, no per-video requests).
+pub fn fetch_playlist(tools: &Tools, url: &str, limit: usize) -> Result<(String, Vec<Item>)> {
+    let (title, items) = list_entries(tools, url, limit)?;
+    Ok((title.unwrap_or_default(), items))
+}
+
+fn list_entries(tools: &Tools, url: &str, limit: usize) -> Result<(Option<String>, Vec<Item>)> {
     let out = Command::new(&tools.ytdlp)
         .args(["--flat-playlist", "-J", "--no-warnings", "--playlist-end"])
         .arg(limit.to_string())
+        .args(cookie_args())
         .arg("--")
         .arg(url)
         .stdin(Stdio::null())
@@ -514,6 +548,10 @@ pub fn search(tools: &Tools, query: &str, filters: &Filters, limit: usize) -> Re
     if !out.status.success() {
         bail!("{}", last_error_line(&String::from_utf8_lossy(&out.stderr)));
     }
+    parse_listing(&out.stdout)
+}
+
+fn parse_listing(json: &[u8]) -> Result<(Option<String>, Vec<Item>)> {
     #[derive(Deserialize)]
     struct Entry {
         id: Option<String>,
@@ -526,18 +564,19 @@ pub fn search(tools: &Tools, query: &str, filters: &Filters, limit: usize) -> Re
     }
     #[derive(Deserialize)]
     struct Playlist {
+        title: Option<String>,
         #[serde(default)]
         entries: Vec<Option<Entry>>,
     }
-    let pl: Playlist = serde_json::from_slice(&out.stdout).context("unexpected yt-dlp output")?;
-    Ok(pl
+    let pl: Playlist = serde_json::from_slice(json).context("unexpected yt-dlp output")?;
+    let items = pl
         .entries
         .into_iter()
         .flatten()
         .filter_map(|e| {
             let id = e.id?;
             if id.len() != 11 {
-                return None; // channels / playlists
+                return None; // channels / nested playlists
             }
             Some(Item {
                 url: format!("https://www.youtube.com/watch?v={id}"),
@@ -550,7 +589,8 @@ pub fn search(tools: &Tools, query: &str, filters: &Filters, limit: usize) -> Re
                 live: matches!(e.live_status.as_deref(), Some("is_live" | "is_upcoming")),
             })
         })
-        .collect())
+        .collect();
+    Ok((pl.title, items))
 }
 
 fn last_error_line(stderr: &str) -> String {
@@ -608,6 +648,7 @@ pub enum SubMode {
     Only,
 }
 
+#[derive(Clone)]
 pub struct Request {
     pub url: String,
     pub format: Format,
@@ -617,9 +658,45 @@ pub struct Request {
     pub audio_lang: Option<String>,
     pub sub_langs: Vec<String>,
     pub sub_mode: SubMode,
+    /// Folder (inside `out_dir`) to save into, e.g. a playlist title.
+    pub subdir: Option<String>,
+    /// Save into a sub-folder named after the channel.
+    pub by_channel: bool,
+}
+
+/// File-system safe folder name (no separators or reserved characters).
+pub fn safe_dirname(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    let short: String = trimmed.chars().take(100).collect();
+    if short.is_empty() { "playlist".to_owned() } else { short }
+}
+
+/// yt-dlp output templates treat `%` specially; make literal text safe.
+fn escape_template(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+fn output_template(req: &Request) -> String {
+    let mut p = escape_template(&req.out_dir.to_string_lossy());
+    if let Some(d) = &req.subdir {
+        p.push('/');
+        p.push_str(&escape_template(&safe_dirname(d)));
+    } else if req.by_channel {
+        p.push_str("/%(channel)s");
+    }
+    p.push_str("/%(title).180B [%(id)s].%(ext)s");
+    p
 }
 
 fn build_args(tools: &Tools, req: &Request) -> Vec<String> {
+    build_args_with(tools, req, &cookie_args())
+}
+
+fn build_args_with(tools: &Tools, req: &Request, cookies: &[String]) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--no-playlist".into(),
         "--newline".into(),
@@ -635,8 +712,9 @@ fn build_args(tools: &Tools, req: &Request) -> Vec<String> {
         "--print".into(),
         "after_move:FILE|%(filepath)s".into(),
         "-o".into(),
-        req.out_dir.join("%(title).180B [%(id)s].%(ext)s").to_string_lossy().into_owned(),
+        output_template(req),
     ];
+    a.extend(cookies.iter().cloned());
     if let Some(ff) = &tools.ffmpeg {
         a.push("--ffmpeg-location".into());
         a.push(ff.to_string_lossy().into_owned());
@@ -784,5 +862,78 @@ mod tests {
     fn rejects_bad_tags() {
         assert!(install_ytdlp("../evil").is_err());
         assert!(install_ytdlp("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    fn req() -> Request {
+        Request {
+            url: "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
+            format: Format::Video,
+            quality: Quality::Best,
+            out_dir: PathBuf::from("/Users/x/Downloads"),
+            audio_lang: None,
+            sub_langs: vec![],
+            sub_mode: SubMode::File,
+            subdir: None,
+            by_channel: false,
+        }
+    }
+
+    fn tools() -> Tools {
+        Tools { ytdlp: PathBuf::from("yt-dlp"), ffmpeg: None }
+    }
+
+    #[test]
+    fn dirname_is_sanitized() {
+        assert_eq!(safe_dirname("A/B: C?"), "A_B_ C_");
+        assert_eq!(safe_dirname("  ..hidden.. "), "hidden");
+        assert_eq!(safe_dirname("///"), "___");
+        assert_eq!(safe_dirname("   "), "playlist");
+        assert_eq!(safe_dirname(&"x".repeat(300)).chars().count(), 100);
+    }
+
+    #[test]
+    fn output_template_variants() {
+        assert_eq!(output_template(&req()), "/Users/x/Downloads/%(title).180B [%(id)s].%(ext)s");
+        let mut r = req();
+        r.by_channel = true;
+        assert!(output_template(&r).contains("/Downloads/%(channel)s/%(title)"));
+        r.subdir = Some("Mix 100% bom".into());
+        let t = output_template(&r);
+        assert!(t.contains("/Downloads/Mix 100%% bom/%(title)"), "{t}");
+        assert!(!t.contains("%(channel)s")); // playlist folder wins over channel folder
+    }
+
+    #[test]
+    fn cookies_are_passed_through() {
+        let with = build_args_with(&tools(), &req(), &["--cookies-from-browser".into(), "chrome".into()]);
+        let i = with.iter().position(|a| a == "--cookies-from-browser").unwrap();
+        assert_eq!(with[i + 1], "chrome");
+        assert!(!build_args_with(&tools(), &req(), &[]).iter().any(|a| a == "--cookies-from-browser"));
+    }
+
+    #[test]
+    fn playlist_urls() {
+        assert!(is_playlist_url("https://www.youtube.com/playlist?list=PLabc"));
+        assert!(!is_playlist_url("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLabc"));
+        assert!(!is_playlist_url("https://www.youtube.com/watch?v=jNQXAC9IVRw"));
+    }
+
+    #[test]
+    fn listing_parses_playlist() {
+        let json = br#"{"title":"Minha lista","entries":[
+            {"id":"jNQXAC9IVRw","title":"Me at the zoo","channel":"jawed","duration":19,"view_count":5},
+            null,
+            {"id":"UCchannelidxxxxxxxxxxxxxxx","title":"canal"},
+            {"id":"dQw4w9WgXcQ","title":"Outro","uploader":"Rick","live_status":"is_live"}]}"#;
+        let (title, items) = parse_listing(json).unwrap();
+        assert_eq!(title.as_deref(), Some("Minha lista"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].channel.as_deref(), Some("jawed"));
+        assert!(items[1].live && items[1].channel.as_deref() == Some("Rick"));
     }
 }

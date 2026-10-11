@@ -27,6 +27,12 @@ struct Settings {
     format: Format,
     quality: Quality,
     auto_update: bool,
+    /// Downloads running at once; the rest wait in the queue.
+    max_parallel: u8,
+    /// Save into a sub-folder per channel.
+    by_channel: bool,
+    /// Browser to read cookies from ("" = off), for age-restricted / sign-in videos.
+    cookies_browser: String,
     /// Unix seconds of the last successful yt-dlp update check.
     last_update_check: u64,
 }
@@ -39,6 +45,9 @@ impl Default for Settings {
             format: Format::Video,
             quality: Quality::Best,
             auto_update: true,
+            max_parallel: 3,
+            by_channel: false,
+            cookies_browser: String::new(),
             last_update_check: 0,
         }
     }
@@ -84,6 +93,7 @@ impl Settings {
 
 enum Msg {
     Results { epoch: u64, result: Result<Vec<Item>, String> },
+    Playlist { epoch: u64, result: Result<(String, Vec<Item>), String> },
     Date { epoch: u64, id: String, date: Option<String> },
     Info { url: String, result: Result<Info, String> },
     Job { id: u64, event: Event },
@@ -125,6 +135,7 @@ enum Tab {
 
 #[derive(PartialEq)]
 enum JobState {
+    Queued,
     Running,
     Processing,
     Done(PathBuf),
@@ -142,6 +153,52 @@ struct Job {
     speed: Option<f64>,
     eta: Option<f64>,
     cancel: CancelHandle,
+    /// Kept so a queued, failed or cancelled job can be (re)started. `None` for history entries.
+    req: Option<Request>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct HistoryEntry {
+    title: String,
+    thumb: Option<String>,
+    kind: String,
+    path: PathBuf,
+}
+
+fn history_path() -> PathBuf {
+    home().join("Library/Application Support/up2me/history.json")
+}
+
+/// Finished downloads from previous sessions (entries whose file is gone are dropped).
+fn load_history() -> Vec<HistoryEntry> {
+    let all: Vec<HistoryEntry> =
+        std::fs::read(history_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    all.into_iter().filter(|e| e.path.exists()).collect()
+}
+
+fn save_history(jobs: &[Job]) {
+    let entries: Vec<HistoryEntry> = jobs
+        .iter()
+        .filter_map(|j| match &j.state {
+            JobState::Done(path) => Some(HistoryEntry { title: j.title.clone(), thumb: j.thumb.clone(), kind: j.kind.clone(), path: path.clone() }),
+            _ => None,
+        })
+        .take(100)
+        .collect();
+    let p = history_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&entries) {
+        let _ = std::fs::write(p, json);
+    }
+}
+
+enum JobAction {
+    Cancel(u64),
+    Retry(u64),
+    Remove(u64),
+    CancelAll,
 }
 
 enum SearchState {
@@ -153,7 +210,7 @@ enum SearchState {
 enum InfoState {
     Loading,
     Ready(Info),
-    Error(String),
+    Error(#[allow(dead_code)] String),
 }
 
 #[derive(Clone)]
@@ -193,8 +250,11 @@ enum Action {
     Select(Item),
     Quick(Item),
     DownloadSelected,
+    DownloadAll,
     CloseSelected,
     Paste,
+    UseClip,
+    DismissClip,
 }
 
 struct Debug {
@@ -203,6 +263,9 @@ struct Debug {
     requested: bool,
     select_first: bool,
     did_select: bool,
+    /// Test hook: queue the first N playlist videos.
+    dl_all: Option<usize>,
+    shot_after: Option<f32>,
 }
 
 struct App {
@@ -224,6 +287,12 @@ struct App {
     toast: Option<(String, Instant)>,
     update: UpdateState,
     pending_update_check: bool,
+    /// Title of the playlist currently listed (None for normal searches).
+    playlist: Option<String>,
+    history_dirty: bool,
+    clip: Option<String>,
+    clip_seen: String,
+    was_focused: bool,
     ytdlp_version: Option<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -487,6 +556,11 @@ impl App {
             toast: None,
             update: UpdateState::Idle,
             pending_update_check: false,
+            playlist: None,
+            history_dirty: false,
+            clip: env("UP2ME_CLIP"),
+            clip_seen: String::new(),
+            was_focused: false,
             ytdlp_version: None,
             tx,
             rx,
@@ -496,8 +570,27 @@ impl App {
                 requested: false,
                 select_first: env("UP2ME_SELECT").is_some(),
                 did_select: false,
+                dl_all: env("UP2ME_DLALL").and_then(|n| n.parse().ok()),
+                shot_after: env("UP2ME_SHOT_AFTER").and_then(|n| n.parse().ok()),
             },
         };
+        engine::set_cookies_browser(Some(app.settings.cookies_browser.clone()));
+        for e in load_history() {
+            let id = app.next_id;
+            app.next_id += 1;
+            app.jobs.push(Job {
+                id,
+                title: e.title,
+                thumb: e.thumb,
+                kind: e.kind,
+                state: JobState::Done(e.path),
+                fraction: 1.0,
+                speed: None,
+                eta: None,
+                cancel: CancelHandle::default(),
+                req: None,
+            });
+        }
         let due = app.settings.auto_update && now_secs().saturating_sub(app.settings.last_update_check) > 24 * 3600;
         let mode = if env("UP2ME_UPDATE").as_deref() == Some("reinstall") {
             UpdateMode::Reinstall
@@ -534,7 +627,7 @@ impl App {
                 app.saved.out_dir = app.settings.out_dir.clone(); // never persist test folders
             }
             let item = Item { id: video_id(&url).unwrap_or_default(), url, title: String::new(), channel: None, duration: None, views: None, upload_date: None, live: false };
-            app.start_job(&item, &opts, &cc.egui_ctx);
+            app.enqueue(&item, &opts, None, &cc.egui_ctx);
             app.tab = Tab::Downloads;
         }
         if env("UP2ME_CC").is_some() {
@@ -562,6 +655,10 @@ impl App {
         }
         if is_url(&q) {
             let url = if q.starts_with("http") { q } else { format!("https://{q}") };
+            if engine::is_playlist_url(&url) {
+                self.start_playlist(url, ctx);
+                return;
+            }
             let item = Item {
                 id: video_id(&url).unwrap_or_default(),
                 url,
@@ -577,6 +674,20 @@ impl App {
             self.limit = if self.filters.sort == Sort::Oldest { OLDEST_LIMIT } else { RESULTS_PAGE };
             self.start_search(ctx);
         }
+    }
+
+    fn start_playlist(&mut self, url: String, ctx: &egui::Context) {
+        let Ok(tools) = self.tools.clone() else { return };
+        self.epoch += 1;
+        self.search = SearchState::Loading;
+        self.searched_query = self.query.trim().to_owned();
+        self.dates_pending = 0;
+        let (epoch, tx, ctx) = (self.epoch, self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = engine::fetch_playlist(&tools, &url, 300).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Playlist { epoch, result });
+            ctx.request_repaint();
+        });
     }
 
     fn start_search(&mut self, ctx: &egui::Context) {
@@ -663,8 +774,15 @@ impl App {
         });
     }
 
-    fn start_job(&mut self, item: &Item, opts: &Options, ctx: &egui::Context) {
-        let Ok(tools) = self.tools.clone() else { return };
+    /// Adds a download to the queue; `pump_queue` starts it when a slot is free.
+    fn enqueue(&mut self, item: &Item, opts: &Options, subdir: Option<String>, ctx: &egui::Context) {
+        self.enqueue_quiet(item, opts, subdir);
+        let l = self.lang();
+        self.toast(l.t("Adicionado em Downloads", "Added to Downloads"));
+        ctx.request_repaint();
+    }
+
+    fn enqueue_quiet(&mut self, item: &Item, opts: &Options, subdir: Option<String>) {
         let id = self.next_id;
         self.next_id += 1;
         let l = self.lang();
@@ -678,21 +796,6 @@ impl App {
                 Format::M4a => "M4A".into(),
             }
         };
-        let cancel = CancelHandle::default();
-        self.jobs.insert(
-            0,
-            Job {
-                id,
-                title: if item.title.is_empty() { item.url.clone() } else { item.title.clone() },
-                thumb: item.thumb(),
-                kind,
-                state: JobState::Running,
-                fraction: 0.0,
-                speed: None,
-                eta: None,
-                cancel: cancel.clone(),
-            },
-        );
         let req = Request {
             url: item.url.clone(),
             format: opts.format,
@@ -701,15 +804,109 @@ impl App {
             audio_lang: opts.audio.clone(),
             sub_langs: if opts.subs_on { opts.sub_langs.iter().cloned().collect() } else { Vec::new() },
             sub_mode: opts.sub_mode,
+            subdir,
+            by_channel: self.settings.by_channel,
         };
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            engine::download(&tools, &req, &cancel, |event| {
-                let _ = tx.send(Msg::Job { id, event });
-                ctx.request_repaint();
+        self.jobs.insert(
+            0,
+            Job {
+                id,
+                title: if item.title.is_empty() { item.url.clone() } else { item.title.clone() },
+                thumb: item.thumb(),
+                kind,
+                state: JobState::Queued,
+                fraction: 0.0,
+                speed: None,
+                eta: None,
+                cancel: CancelHandle::default(),
+                req: Some(req),
+            },
+        );
+    }
+
+    /// Starts queued jobs (oldest first) while fewer than `max_parallel` are running.
+    fn pump_queue(&mut self, ctx: &egui::Context) {
+        let Ok(tools) = self.tools.clone() else { return };
+        let max = self.settings.max_parallel.clamp(1, 8) as usize;
+        let mut active = self.jobs.iter().filter(|j| matches!(j.state, JobState::Running | JobState::Processing)).count();
+        for i in (0..self.jobs.len()).rev() {
+            if active >= max {
+                break;
+            }
+            if self.jobs[i].state != JobState::Queued {
+                continue;
+            }
+            let Some(req) = self.jobs[i].req.clone() else { continue };
+            self.jobs[i].state = JobState::Running;
+            active += 1;
+            let (id, cancel) = (self.jobs[i].id, self.jobs[i].cancel.clone());
+            let (tools, tx, ctx) = (tools.clone(), self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                engine::download(&tools, &req, &cancel, |event| {
+                    let _ = tx.send(Msg::Job { id, event });
+                    ctx.request_repaint();
+                });
             });
-        });
-        self.toast(l.t("Adicionado em Downloads", "Added to Downloads"));
+        }
+    }
+
+    fn download_all(&mut self, ctx: &egui::Context) {
+        let items: Vec<Item> = self.visible().into_iter().cloned().collect();
+        let opts = Options::from_settings(&self.settings);
+        let folder = self.playlist.clone();
+        for it in &items {
+            self.enqueue_quiet(it, &opts, folder.clone());
+        }
+        let l = self.lang();
+        self.toast(format!("{} {}", items.len(), l.t("vídeos adicionados à fila", "videos added to the queue")));
+        ctx.request_repaint();
+    }
+
+    fn apply_job_action(&mut self, a: JobAction) {
+        match a {
+            JobAction::Cancel(id) => {
+                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                    match j.state {
+                        JobState::Queued => j.state = JobState::Cancelled,
+                        JobState::Running | JobState::Processing => j.cancel.cancel(),
+                        _ => {}
+                    }
+                }
+            }
+            JobAction::CancelAll => {
+                for j in &mut self.jobs {
+                    match j.state {
+                        JobState::Queued => j.state = JobState::Cancelled,
+                        JobState::Running | JobState::Processing => j.cancel.cancel(),
+                        _ => {}
+                    }
+                }
+            }
+            JobAction::Retry(id) => {
+                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id && j.req.is_some()) {
+                    j.state = JobState::Queued;
+                    j.fraction = 0.0;
+                    j.speed = None;
+                    j.eta = None;
+                    j.cancel = CancelHandle::default();
+                }
+            }
+            JobAction::Remove(id) => {
+                self.jobs.retain(|j| j.id != id);
+                self.history_dirty = true;
+            }
+        }
+    }
+
+    fn check_clipboard(&mut self) {
+        if self.debug.shot.is_some() {
+            return;
+        }
+        let Ok(out) = std::process::Command::new("pbpaste").output() else { return };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if text.len() < 300 && !text.contains('\n') && is_url(&text) && text != self.clip_seen && text != self.query.trim() {
+            self.clip = Some(text);
+        }
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
@@ -719,6 +916,7 @@ impl App {
                 Msg::Results { epoch, result } if epoch == self.epoch => match result {
                     Ok(items) => {
                         self.results = items;
+                        self.playlist = None;
                         self.search = SearchState::Idle;
                         if self.filters.sort == Sort::Oldest {
                             self.enrich_dates(ctx);
@@ -727,6 +925,15 @@ impl App {
                     Err(e) => self.search = SearchState::Error(e),
                 },
                 Msg::Results { .. } => {}
+                Msg::Playlist { epoch, result } if epoch == self.epoch => match result {
+                    Ok((title, items)) => {
+                        self.results = items;
+                        self.playlist = Some(title);
+                        self.search = SearchState::Idle;
+                    }
+                    Err(e) => self.search = SearchState::Error(e),
+                },
+                Msg::Playlist { .. } => {}
                 Msg::Date { epoch, id, date } if epoch == self.epoch => {
                     self.dates_pending = self.dates_pending.saturating_sub(1);
                     if let Some(it) = self.results.iter_mut().find(|i| i.id == id) {
@@ -801,6 +1008,7 @@ impl App {
                         Event::Done(p) => {
                             job.fraction = 1.0;
                             job.state = JobState::Done(p);
+                            self.history_dirty = true;
                             if !focused {
                                 let script = format!(
                                     "display notification {:?} with title \"up2me\"",
@@ -877,6 +1085,28 @@ impl App {
 
     fn search_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let l = self.lang();
+        // --- link found on the clipboard
+        if let Some(url) = self.clip.clone() {
+            egui::Frame::new()
+                .fill(ACCENT.gamma_multiply(0.16))
+                .stroke(Stroke::new(1.0, ACCENT))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(l.t("Link na área de transferência:", "Link on the clipboard:"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(l.t("Ignorar", "Dismiss")).clicked() {
+                                actions.push(Action::DismissClip);
+                            }
+                            if ui.add(primary_button(l.t("Abrir", "Open"))).clicked() {
+                                actions.push(Action::UseClip);
+                            }
+                            ui.add(egui::Label::new(RichText::new(&url).weak()).truncate());
+                        });
+                    });
+                });
+        }
         // --- search bar
         ui.horizontal(|ui| {
             let w = ui.available_width() - 230.0;
@@ -980,7 +1210,18 @@ impl App {
 
         let visible: Vec<Item> = self.visible().into_iter().cloned().collect();
         ui.horizontal(|ui| {
-            ui.weak(format!("{} {}", visible.len(), l.t("resultados", "results")));
+            if let Some(title) = &self.playlist {
+                ui.label(RichText::new(format!("{}: {}", l.t("Playlist", "Playlist"), if title.is_empty() { "?" } else { title })).strong());
+            }
+            let noun = if self.playlist.is_some() { l.t("vídeos", "videos") } else { l.t("resultados", "results") };
+            ui.weak(format!("{} {noun}", visible.len()));
+            if self.playlist.is_some() && !visible.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary_button(&format!("{} ({})", l.t("Baixar todos", "Download all"), visible.len()))).clicked() {
+                        actions.push(Action::DownloadAll);
+                    }
+                });
+            }
             if self.dates_pending > 0 {
                 ui.spinner();
                 ui.weak(format!("{} ({})", l.t("Ordenando por data…", "Sorting by date…"), self.dates_pending));
@@ -1027,7 +1268,7 @@ impl App {
                 ui.add_space(2.0);
             }
             ui.add_space(6.0);
-            if self.filters.sort != Sort::Oldest {
+            if self.filters.sort != Sort::Oldest && self.playlist.is_none() {
                 ui.vertical_centered(|ui| {
                     if ui.button(l.t("Mostrar mais resultados", "Show more results")).clicked() {
                         actions.push(Action::LoadMore);
@@ -1232,14 +1473,23 @@ impl App {
 
     fn downloads_tab(&mut self, ui: &mut egui::Ui) {
         let l = self.lang();
+        let mut actions: Vec<JobAction> = Vec::new();
+        let busy = self.jobs.iter().filter(|j| matches!(j.state, JobState::Queued | JobState::Running | JobState::Processing)).count();
         ui.horizontal(|ui| {
             ui.label(RichText::new(l.t("Downloads", "Downloads")).size(20.0).strong());
+            if busy > 0 {
+                ui.weak(format!("{busy} {}", l.t("em andamento ou na fila", "active or queued")));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.link(l.t("Limpar concluídos", "Clear finished")).clicked() {
-                    self.jobs.retain(|j| matches!(j.state, JobState::Running | JobState::Processing));
+                    self.jobs.retain(|j| matches!(j.state, JobState::Queued | JobState::Running | JobState::Processing));
+                    self.history_dirty = true;
                 }
                 if ui.link(l.t("Abrir pasta", "Open folder")).clicked() {
                     open_path(&self.settings.out_dir, false);
+                }
+                if busy > 0 && ui.link(l.t("Cancelar todos", "Cancel all")).clicked() {
+                    actions.push(JobAction::CancelAll);
                 }
             });
         });
@@ -1251,7 +1501,6 @@ impl App {
             });
             return;
         }
-        let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for job in &self.jobs {
                 card(ui, false, |ui| {
@@ -1260,6 +1509,14 @@ impl App {
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(RichText::new(&job.title).strong().size(15.0)).truncate());
                             match &job.state {
+                                JobState::Queued => {
+                                    ui.horizontal(|ui| {
+                                        ui.weak(format!("{}  ·  {}", job.kind, l.t("Na fila", "Queued")));
+                                        if ui.small_button(l.t("Cancelar", "Cancel")).clicked() {
+                                            actions.push(JobAction::Cancel(job.id));
+                                        }
+                                    });
+                                }
                                 JobState::Running | JobState::Processing => {
                                     let processing = job.state == JobState::Processing;
                                     ui.horizontal(|ui| {
@@ -1270,7 +1527,7 @@ impl App {
                                                 .animate(processing),
                                         );
                                         if ui.button(l.t("Cancelar", "Cancel")).clicked() {
-                                            job.cancel.cancel();
+                                            actions.push(JobAction::Cancel(job.id));
                                         }
                                     });
                                     let mut s = format!("{}  ·  ", job.kind);
@@ -1297,25 +1554,35 @@ impl App {
                                             open_path(path, false);
                                         }
                                         if ui.small_button(l.t("Remover", "Remove")).clicked() {
-                                            remove = Some(job.id);
+                                            actions.push(JobAction::Remove(job.id));
                                         }
                                     });
                                 }
                                 JobState::Failed(e) => {
-                                    ui.colored_label(Color32::LIGHT_RED, format!("✘ {e}"));
+                                    ui.colored_label(Color32::LIGHT_RED, format!("× {e}"));
                                     ui.weak(l.t(
                                         "Se o erro persistir, verifique atualizações do yt-dlp em Ajustes.",
                                         "If this keeps happening, check for yt-dlp updates in Settings.",
                                     ));
-                                    if ui.small_button(l.t("Remover", "Remove")).clicked() {
-                                        remove = Some(job.id);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if job.req.is_some() && ui.small_button(l.t("Tentar novamente", "Try again")).clicked() {
+                                            actions.push(JobAction::Retry(job.id));
+                                        }
+                                        if ui.small_button(l.t("Remover", "Remove")).clicked() {
+                                            actions.push(JobAction::Remove(job.id));
+                                        }
+                                    });
                                 }
                                 JobState::Cancelled => {
                                     ui.weak(l.t("Cancelado", "Cancelled"));
-                                    if ui.small_button(l.t("Remover", "Remove")).clicked() {
-                                        remove = Some(job.id);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if job.req.is_some() && ui.small_button(l.t("Tentar novamente", "Try again")).clicked() {
+                                            actions.push(JobAction::Retry(job.id));
+                                        }
+                                        if ui.small_button(l.t("Remover", "Remove")).clicked() {
+                                            actions.push(JobAction::Remove(job.id));
+                                        }
+                                    });
                                 }
                             }
                         });
@@ -1324,8 +1591,8 @@ impl App {
                 ui.add_space(2.0);
             }
         });
-        if let Some(id) = remove {
-            self.jobs.retain(|j| j.id != id);
+        for a in actions {
+            self.apply_job_action(a);
         }
     }
 
@@ -1370,6 +1637,37 @@ impl App {
                 }
             });
         });
+        card(ui, false, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(l.t("Downloads", "Downloads")).strong());
+            ui.horizontal(|ui| {
+                ui.label(l.t("Simultâneos:", "At once:"));
+                egui::ComboBox::from_id_salt("parallel").selected_text(s.max_parallel.to_string()).width(60.0).show_ui(ui, |ui| {
+                    for n in 1..=6u8 {
+                        ui.selectable_value(&mut s.max_parallel, n, n.to_string());
+                    }
+                });
+                ui.weak(l.t("os demais esperam na fila", "the rest wait in the queue"));
+            });
+            ui.checkbox(&mut s.by_channel, l.t("Organizar em subpastas por canal", "Organize into sub-folders by channel"));
+            ui.horizontal(|ui| {
+                ui.label(l.t("Cookies do navegador:", "Browser cookies:"));
+                let shown = match s.cookies_browser.as_str() {
+                    "" => l.t("Nenhum", "None").to_owned(),
+                    b => b[..1].to_uppercase() + &b[1..],
+                };
+                egui::ComboBox::from_id_salt("cookies").selected_text(shown).width(120.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.cookies_browser, String::new(), l.t("Nenhum", "None"));
+                    for (id, name) in [("safari", "Safari"), ("chrome", "Chrome"), ("firefox", "Firefox"), ("brave", "Brave"), ("edge", "Edge")] {
+                        ui.selectable_value(&mut s.cookies_browser, id.to_owned(), name);
+                    }
+                });
+            });
+            ui.weak(l.t(
+                "Para vídeos com restrição de idade ou que pedem login. O macOS pode pedir permissão (o Safari exige Acesso Total ao Disco).",
+                "For age-restricted or sign-in videos. macOS may ask for permission (Safari needs Full Disk Access).",
+            ));
+        });
         let mut check_now = false;
         card(ui, false, |ui| {
             ui.set_width(ui.available_width());
@@ -1408,7 +1706,7 @@ impl App {
                                 ui.colored_label(Color32::from_rgb(80, 200, 120), format!("✔ {} {v}", l.t("Atualizado para", "Updated to")));
                             }
                             UpdateState::Failed(e) => {
-                                ui.colored_label(Color32::LIGHT_RED, format!("✘ {e}"));
+                                ui.colored_label(Color32::LIGHT_RED, format!("× {e}"));
                             }
                             UpdateState::Idle => {}
                         }
@@ -1443,6 +1741,13 @@ impl App {
                 }
             }
         }
+        if let Some(n) = self.debug.dl_all {
+            if self.playlist.is_some() {
+                self.results.truncate(n);
+                self.debug.dl_all = None;
+                self.download_all(ctx);
+            }
+        }
         let Some(path) = self.debug.shot.clone() else { return };
         let elapsed = self.debug.start.elapsed().as_secs_f32();
         let loaded = !matches!(self.search, SearchState::Loading)
@@ -1450,7 +1755,9 @@ impl App {
             && !matches!(self.update, UpdateState::Checking | UpdateState::Updating(_))
             && self.jobs.iter().all(|j| !matches!(j.state, JobState::Running | JobState::Processing));
         let info_ready = !self.debug.select_first || self.selected.as_ref().is_some_and(|s| !matches!(s.info, InfoState::Loading));
-        if !self.debug.requested && elapsed > 2.0 && ((loaded && info_ready && elapsed > 6.0) || elapsed > 60.0) {
+        let by_time = self.debug.shot_after.is_some_and(|t| elapsed > t);
+        let ready = self.debug.shot_after.is_none() && loaded && info_ready && elapsed > 6.0;
+        if !self.debug.requested && elapsed > 2.0 && (ready || by_time || elapsed > 120.0) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.debug.requested = true;
         }
@@ -1459,8 +1766,13 @@ impl App {
                 if let egui::Event::Screenshot { image, .. } = e {
                     let (w, h) = (image.width() as u32, image.height() as u32);
                     let raw: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
-                    if let Some(img) = image::RgbaImage::from_raw(w, h, raw) {
-                        let _ = img.save(&path);
+                    match image::RgbaImage::from_raw(w, h, raw) {
+                        Some(img) => {
+                            if let Err(e) = img.save(&path) {
+                                eprintln!("screenshot save failed: {e}");
+                            }
+                        }
+                        None => eprintln!("screenshot has unexpected size {w}x{h}"),
                     }
                     std::process::exit(0);
                 }
@@ -1474,7 +1786,13 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
+        self.pump_queue(&ctx);
         self.debug_tick(&ctx);
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.was_focused {
+            self.check_clipboard();
+        }
+        self.was_focused = focused;
         let l = self.lang();
         let mut actions: Vec<Action> = Vec::new();
 
@@ -1501,7 +1819,7 @@ impl eframe::App for App {
             }
         });
         // Server-side filters changed → search again.
-        if self.filters.server_part() != before.server_part() && !self.searched_query.is_empty() && self.query.trim() == self.searched_query {
+        if self.filters.server_part() != before.server_part() && self.playlist.is_none() && !self.searched_query.is_empty() && self.query.trim() == self.searched_query {
             actions.push(Action::Search);
         }
         // Sorting by oldest uses a smaller page (dates cost one request per video).
@@ -1523,11 +1841,26 @@ impl eframe::App for App {
                 Action::Select(item) => self.select(item, &ctx),
                 Action::Quick(item) => {
                     let opts = Options::from_settings(&self.settings);
-                    self.start_job(&item, &opts, &ctx);
+                    let folder = self.playlist.clone();
+                    self.enqueue(&item, &opts, folder, &ctx);
                 }
                 Action::DownloadSelected => {
                     if let Some(sel) = self.selected.take() {
-                        self.start_job(&sel.item, &sel.opts, &ctx);
+                        let folder = self.playlist.clone();
+                        self.enqueue(&sel.item, &sel.opts, folder, &ctx);
+                    }
+                }
+                Action::DownloadAll => self.download_all(&ctx),
+                Action::UseClip => {
+                    if let Some(url) = self.clip.take() {
+                        self.clip_seen = url.clone();
+                        self.query = url;
+                        self.run_query(&ctx);
+                    }
+                }
+                Action::DismissClip => {
+                    if let Some(url) = self.clip.take() {
+                        self.clip_seen = url;
                     }
                 }
                 Action::CloseSelected => self.selected = None,
@@ -1558,7 +1891,12 @@ impl eframe::App for App {
         }
         let _ = l;
 
+        if self.history_dirty {
+            save_history(&self.jobs);
+            self.history_dirty = false;
+        }
         if self.settings != self.saved {
+            engine::set_cookies_browser(Some(self.settings.cookies_browser.clone()));
             self.settings.save();
             self.saved = self.settings.clone();
         }

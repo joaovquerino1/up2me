@@ -18,7 +18,12 @@ Interface em **português (Brasil)** e inglês. Usa [`yt-dlp`](https://github.co
 - **Formatos:** vídeo MP4 (H.264/AAC, até 4K), áudio MP3 (com capa) ou M4A.
 - **Faixas de áudio:** escolha o idioma da dublagem quando o vídeo tiver várias.
 - **Legendas:** baixe como `.srt`, embuta no MP4 ou baixe só as legendas (manuais e automáticas).
-- **Fila de downloads** com progresso, velocidade, tempo restante e cancelamento.
+- **Playlists:** cole o link de uma playlist, veja os vídeos e use **Baixar todos** (salva numa subpasta com o nome da playlist).
+- **Fila de downloads** com progresso, velocidade, tempo restante, cancelamento, **tentar novamente** e limite de downloads simultâneos.
+- **Histórico** que continua depois de fechar o app.
+- **Link na área de transferência:** o app avisa quando você copia um link do YouTube e abre com um clique.
+- **Organização:** opção de salvar em subpastas por canal.
+- **Cookies do navegador** (opcional) para vídeos com restrição de idade ou que pedem login.
 - **Ferramentas embutidas** no `.app` (`yt-dlp`, `ffmpeg`, `ffprobe`), sem instalar nada.
 - **Atualização automática do `yt-dlp`** (1x por dia, com verificação de checksum).
 - Notificação do macOS ao concluir um download.
@@ -79,7 +84,12 @@ A **native macOS (Apple Silicon)** app written in **Rust** to search and downloa
 - **Formats:** MP4 video (H.264/AAC, up to 4K), MP3 audio (with cover art) or M4A.
 - **Audio tracks:** pick the dubbed language when a video has several.
 - **Subtitles:** save as `.srt`, embed into the MP4, or download subtitles only (manual and auto-generated).
-- **Download queue** with progress, speed, ETA and cancel.
+- **Playlists:** paste a playlist link, browse its videos and **Download all** (saved into a folder named after the playlist).
+- **Download queue** with progress, speed, ETA, cancel, **retry** and a limit on simultaneous downloads.
+- **History** that survives restarts.
+- **Clipboard link detection:** the app notices a copied YouTube link and opens it in one click.
+- **Organization:** optional sub-folders per channel.
+- **Browser cookies** (optional) for age-restricted or sign-in videos.
 - **Bundled tools** (`yt-dlp`, `ffmpeg`, `ffprobe`), nothing to install.
 - **Automatic `yt-dlp` updates** (once a day, checksum-verified).
 

@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 [[ -d vendor/yt-dlp && -f vendor/ffmpeg/ffmpeg && -f vendor/ffprobe/ffprobe ]] || ./scripts/fetch-tools.sh
 [[ -n "${UP2ME_NATIVE:-}" ]] && export RUSTFLAGS="-C target-cpu=native"
 cargo build --release
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 APP=target/up2me.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
@@ -23,8 +24,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleExecutable</key><string>up2me</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleLocalizations</key><array><string>pt-BR</string><string>en</string></array>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
